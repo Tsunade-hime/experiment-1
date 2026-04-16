@@ -16,4 +16,4 @@ from .C3_FasterBlock import *
 from .C2f_MSBlock import *
 from .C2f_HGBlock import *
 
-
+from .FuseConvolution import *

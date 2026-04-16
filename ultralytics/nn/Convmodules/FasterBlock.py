@@ -20,7 +20,7 @@ class ConvBNAct(nn.Module):
             groups=g, dilation=d, bias=False
         )
         self.bn = nn.BatchNorm2d(c2)
-        self.act = nn.ReLU(inplace=True) if act else nn.Identity()
+        self.act = nn.SiLU() if act else nn.Identity()
 
     def forward(self, x):
         return self.act(self.bn(self.conv(x)))
@@ -113,7 +113,7 @@ class FasterBlock(nn.Module):
 
         # 3) BN + ReLU：只放在中间层，贴近 FasterNet 论文设计
         self.bn = nn.BatchNorm2d(hidden)
-        self.act = nn.ReLU(inplace=True) if act else nn.Identity()
+        self.act = nn.SiLU() if act else nn.Identity()
 
         # 4) 第二层 PWConv：通道压回输出维度
         self.pwconv2 = nn.Conv2d(hidden, c2, kernel_size=1, stride=1, padding=0, bias=False)

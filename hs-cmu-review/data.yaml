@@ -20,14 +20,3 @@ test: images/test
 train: images/train
 val: images/val
 
-augment:
-  albumentations:
-    - ToGray: {}                       # Convert to grayscale
-    - CLAHE:
-        clip_limit: 2.0
-        tile_grid_size: [8, 8]
-    - GaussNoise:
-        var_limit: [10.0, 30.0]
-    - RandomBrightnessContrast:
-        brightness_limit: 0.1
-        contrast_limit: 0.1

@@ -23,3 +23,5 @@ from .GLFA import *
 
 from .DySample import *
 from .HAU import *
+
+from .HystoBlock import *

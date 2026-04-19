@@ -1,6 +1,6 @@
 """
-FuseConv: A structurally re-parameterizable convolutional block for YOLO.
-Includes DropPath regularization for training stability on small datasets.
+FuseConv: Multi-branch re-parameterizable convolution block.
+Fully DDP-compatible – all tensors are forced contiguous.
 """
 
 import torch
@@ -14,31 +14,38 @@ __all__ = [
     'FuseConvWrapper',
 ]
 
-
 class ECA(nn.Module):
-    """Efficient Channel Attention (ECA) module (CVPR 2020)."""
+    """
+    Efficient Channel Attention (ECA) – DDP‑Safe Version.
+    Gradient stride warnings are eliminated by forcing contiguous memory layout.
+    """
     def __init__(self, channels, gamma=2, b=1):
         super(ECA, self).__init__()
         t = int(abs(math.log(channels, 2) + b) / gamma)
         kernel_size = t if t % 2 else t + 1
         
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.conv = nn.Conv1d(1, 1, kernel_size=kernel_size, 
+        self.conv = nn.Conv1d(1, 1, kernel_size=kernel_size,
                               padding=kernel_size // 2, bias=False)
         self.sigmoid = nn.Sigmoid()
         
+        # 🔧 Force weight tensor to be contiguous (eliminates DDP warning)
+        self.conv.weight.data = self.conv.weight.data.contiguous()
+        
     def forward(self, x):
-        b, c, _, _ = x.size()
-        y = self.avg_pool(x)
-        y = self.conv(y.squeeze(-1).transpose(-1, -2))
-        y = y.transpose(-1, -2).contiguous().unsqueeze(-1)   # Fixed contiguity
+        b, c, h, w = x.size()
+        y = self.avg_pool(x)                          # [B, C, 1, 1]
+        y = y.squeeze(-1).transpose(-1, -2)           # [B, 1, C]
+        y = self.conv(y)                              # [B, 1, C]
+        y = y.transpose(-1, -2).unsqueeze(-1)         # [B, C, 1, 1]
+        y = y.contiguous()                            # 🔧 Ensure contiguity
         y = self.sigmoid(y)
-        return x * y.expand_as(x)
+        return (x * y).contiguous()                   # 🔧 Final output contiguous
 
 
 class ConvBN(nn.Module):
-    """Helper: Conv2d + BatchNorm2d layer."""
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, 
+    """Conv2d + BatchNorm2d with fusion support."""
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1,
                  padding=0, dilation=1, groups=1, bias=False):
         super(ConvBN, self).__init__()
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride,
@@ -75,7 +82,7 @@ class ConvBN(nn.Module):
 
 
 class IdentityConv(nn.Module):
-    """Helper: Identity branch represented as a 1x1 conv with fixed weights."""
+    """Identity branch as a 1x1 conv with fixed weights."""
     def __init__(self, channels):
         super(IdentityConv, self).__init__()
         self.channels = channels
@@ -87,7 +94,7 @@ class IdentityConv(nn.Module):
 
 
 class DropPath(nn.Module):
-    """Drop paths (Stochastic Depth) per sample (when applied to residual branches)."""
+    """Stochastic Depth per sample."""
     def __init__(self, drop_prob=0.1):
         super(DropPath, self).__init__()
         self.drop_prob = drop_prob
@@ -98,35 +105,18 @@ class DropPath(nn.Module):
         keep_prob = 1 - self.drop_prob
         shape = (x.shape[0],) + (1,) * (x.ndim - 1)
         random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
-        random_tensor.floor_()  # binarize
+        random_tensor.floor_()
         output = x.div(keep_prob) * random_tensor
-        return output
+        return output.contiguous()
 
 
 class FuseConv(nn.Module):
     """
-    FuseConv: Multi-branch re-parameterizable convolution block.
-    
-    **Regularization added for small medical datasets:**
-    - DropPath on each non‑identity branch (drop_prob=0.1)
-    - Enhanced contiguity handling
-    
-    Args:
-        in_channels (int): Number of input channels.
-        out_channels (int): Number of output channels.
-        stride (int): Convolution stride.
-        padding (int): Convolution padding.
-        dilation (int): Convolution dilation.
-        groups (int): Number of blocked connections from input to output.
-        act (nn.Module): Activation function (default: nn.SiLU).
-        use_eca (bool): Whether to use ECA attention.
-        use_identity (bool): Whether to use identity branch.
-        drop_path_rate (float): Stochastic depth rate.
-        deploy (bool): Whether in deployment mode (fused).
+    FuseConv: Multi-branch re-parameterizable convolution.
+    DDP warnings eliminated; includes DropPath regularization.
     """
-    
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1,
-                 padding=1, dilation=1, groups=1, act=nn.SiLU(), 
+                 padding=1, dilation=1, groups=1, act=nn.SiLU(),
                  use_eca=True, use_identity=True, drop_path_rate=0.1, deploy=False):
         super(FuseConv, self).__init__()
         
@@ -148,27 +138,26 @@ class FuseConv(nn.Module):
             self.bn = nn.Identity()
         else:
             # Branch 1: Multi-Scale Perception
-            self.ms_dw5 = ConvBN(in_channels, in_channels, 5, stride, 2, 
+            self.ms_dw5 = ConvBN(in_channels, in_channels, 5, stride, 2,
                                  groups=in_channels, bias=False)
-            self.ms_dw3 = ConvBN(in_channels, in_channels, 3, 1, 1, 
+            self.ms_dw3 = ConvBN(in_channels, in_channels, 3, 1, 1,
                                  groups=in_channels, bias=False)
             self.ms_pw = ConvBN(in_channels * 2, out_channels, 1, bias=False)
-            self.ms_drop = DropPath(drop_path_rate)   # Regularization
+            self.ms_drop = DropPath(drop_path_rate)
             
-            # Branch 2: Pathway Boosting (asymmetric convolutions)
-            self.pb_conv1x3 = ConvBN(in_channels, out_channels, (1, 3), stride, 
+            # Branch 2: Pathway Boosting
+            self.pb_conv1x3 = ConvBN(in_channels, out_channels, (1, 3), stride,
                                      (0, 1), bias=False)
-            self.pb_conv3x1 = ConvBN(out_channels, out_channels, (3, 1), 1, 
+            self.pb_conv3x1 = ConvBN(out_channels, out_channels, (3, 1), 1,
                                      (1, 0), bias=False)
-            self.pb_drop = DropPath(drop_path_rate)   # Regularization
+            self.pb_drop = DropPath(drop_path_rate)
             
             # Branch 3: Identity
             if use_identity:
                 if in_channels == out_channels and stride == 1:
                     self.identity = IdentityConv(in_channels)
                 else:
-                    self.identity = ConvBN(in_channels, out_channels, 1, stride, 
-                                           bias=False)
+                    self.identity = ConvBN(in_channels, out_channels, 1, stride, bias=False)
             else:
                 self.identity = None
             
@@ -184,17 +173,17 @@ class FuseConv(nn.Module):
         
         identity = x
         
-        # Branch 1: Multi-Scale Perception with DropPath
+        # Branch 1: Multi-Scale
         ms_out5 = self.ms_dw5(x)
         ms_out3 = self.ms_dw3(ms_out5)
         ms_out = torch.cat([ms_out5, ms_out3], dim=1)
         ms_out = self.ms_pw(ms_out)
-        ms_out = self.ms_drop(ms_out)   # Apply DropPath
+        ms_out = self.ms_drop(ms_out)
         
-        # Branch 2: Pathway Boosting with DropPath
+        # Branch 2: Pathway Boosting
         pb_out = self.pb_conv1x3(x)
         pb_out = self.pb_conv3x1(pb_out)
-        pb_out = self.pb_drop(pb_out)   # Apply DropPath
+        pb_out = self.pb_drop(pb_out)
         
         # Combine
         out = ms_out + pb_out
@@ -205,21 +194,87 @@ class FuseConv(nn.Module):
         out = self.eca(out)
         out = self.act(out)
         
-        # Ensure contiguity for DDP
         return out.contiguous()
     
     def fuse(self):
-        """Fuse training branches into a single 3x3 convolution."""
+        """Fuse branches into a single 3x3 convolution."""
         if self.deploy:
             return
         
-        # ... (fuse logic identical to previous version) ...
-        # For brevity, the full fuse code is omitted here but remains exactly the same.
-        # Copy the fuse() method from the original FuseConv.
-        pass  # Replace with actual fuse implementation from earlier
+        ms_dw5_w, ms_dw5_b = self.ms_dw5.get_fused_weights()
+        ms_dw3_w, ms_dw3_b = self.ms_dw3.get_fused_weights()
+        ms_pw_w, ms_pw_b = self.ms_pw.get_fused_weights()
+        
+        pb_conv1x3_w, pb_conv1x3_b = self.pb_conv1x3.get_fused_weights()
+        pb_conv3x1_w, pb_conv3x1_b = self.pb_conv3x1.get_fused_weights()
+        
+        if self.identity is not None:
+            if isinstance(self.identity, ConvBN):
+                id_w, id_b = self.identity.get_fused_weights()
+            else:
+                id_w = self.identity.weight
+                id_b = self.identity.bias
+        else:
+            id_w = torch.zeros(self.out_channels, self.in_channels, 1, 1,
+                              device=ms_dw5_w.device)
+            id_b = torch.zeros(self.out_channels, device=ms_dw5_w.device)
+        
+        fused_w = torch.zeros(self.out_channels, self.in_channels, 3, 3,
+                             device=ms_dw5_w.device)
+        fused_b = torch.zeros(self.out_channels, device=ms_dw5_w.device)
+        
+        def pad_to_3x3(kernel):
+            kh, kw = kernel.shape[-2:]
+            if kh == 3 and kw == 3:
+                return kernel
+            pad_h = (3 - kh) // 2
+            pad_w = (3 - kw) // 2
+            return F.pad(kernel, (pad_w, pad_w, pad_h, pad_h))
+        
+        # Multi-scale branch fusion
+        ms_dw5_expanded = torch.zeros(self.out_channels, self.in_channels, 5, 5,
+                                      device=ms_dw5_w.device)
+        for i in range(self.in_channels):
+            ms_dw5_expanded[i, i] = ms_dw5_w[i, 0]
+        ms_dw5_3x3 = ms_dw5_expanded[:, :, 1:4, 1:4]
+        
+        ms_dw3_expanded = torch.zeros(self.out_channels, self.in_channels, 3, 3,
+                                      device=ms_dw3_w.device)
+        for i in range(self.in_channels):
+            ms_dw3_expanded[i, i] = ms_dw3_w[i, 0]
+        
+        ms_combined = F.conv2d(ms_dw5_3x3 + ms_dw3_expanded, ms_pw_w.permute(1, 0, 2, 3))
+        fused_w += ms_combined
+        fused_b += ms_pw_b
+        
+        # Pathway boosting fusion
+        pb_1x3_padded = pad_to_3x3(pb_conv1x3_w)
+        pb_3x1_padded = pad_to_3x3(pb_conv3x1_w)
+        pb_combined = F.conv2d(pb_1x3_padded, pb_3x1_padded.permute(1, 0, 2, 3))
+        fused_w += pb_combined
+        fused_b += pb_conv3x1_b
+        
+        # Identity fusion
+        id_padded = pad_to_3x3(id_w)
+        fused_w += id_padded
+        fused_b += id_b
+        
+        self.fused_conv = nn.Conv2d(self.in_channels, self.out_channels, 3,
+                                    self.stride, self.padding, self.dilation,
+                                    self.groups, bias=True)
+        self.fused_conv.weight.data = fused_w
+        self.fused_conv.bias.data = fused_b
+        
+        # Clean up
+        del self.ms_dw5, self.ms_dw3, self.ms_pw, self.ms_drop
+        del self.pb_conv1x3, self.pb_conv3x1, self.pb_drop
+        if hasattr(self, 'identity'):
+            del self.identity
+        
+        self.deploy = True
+        return self
 
 
-# Wrapper for YOLO compatibility
 def autopad(k, p=None, d=1):
     if d > 1:
         k = d * (k - 1) + 1 if isinstance(k, int) else [d * (x - 1) + 1 for x in k]
@@ -229,10 +284,10 @@ def autopad(k, p=None, d=1):
 
 
 class FuseConvWrapper(nn.Module):
-    """YOLO‑compatible wrapper for FuseConv."""
+    """YOLO-compatible wrapper."""
     def __init__(self, c1, c2, k=3, s=1, p=None, g=1, d=1, act=True, drop_path_rate=0.1):
         super().__init__()
-        self.conv = FuseConv(c1, c2, k, s, autopad(k, p, d), d, g, 
+        self.conv = FuseConv(c1, c2, k, s, autopad(k, p, d), d, g,
                              act=nn.SiLU() if act else nn.Identity(),
                              drop_path_rate=drop_path_rate)
         self.bn = nn.Identity()

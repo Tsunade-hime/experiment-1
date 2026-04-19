@@ -19,3 +19,9 @@ names:
 test: images/test
 train: images/train
 val: images/val
+
+# Add to your dataset YAML or training script
+albumentations:
+  - CLAHE (clip_limit=2.0, tile_grid_size=(8,8))   # Enhances contrast
+  - GaussNoise (var_limit=(10.0, 30.0))            # Simulates sensor noise
+  - RandomBrightnessContrast (brightness_limit=0.1, contrast_limit=0.1)

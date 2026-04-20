@@ -21,6 +21,7 @@ from .CirculantAttention import *
 from .MHLA import *
 from .GLFA import *
 from .DMCA import *
+from .HystoAttention import *
 
 from .DySample import *
 from .HAU import *

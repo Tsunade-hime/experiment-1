@@ -16,8 +16,8 @@ from .C3_FasterBlock import *
 from .C2f_MSBlock import *
 from .C2f_HGBlock import *
 from .SW_C3k2 import *
-from .DFSHA import *
 from .DEAC2f import *
 from .LSC2f import *
+from .DMA import *
 
 from .FuseConvolution import *

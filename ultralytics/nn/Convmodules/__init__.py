@@ -20,5 +20,6 @@ from .DEAC2f import *
 from .LSC2f import *
 from .DMA import *
 from .sonic import *
+from .RFAConv import *
 
 from .FuseConvolution import *

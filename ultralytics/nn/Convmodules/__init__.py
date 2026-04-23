@@ -19,5 +19,6 @@ from .SW_C3k2 import *
 from .DEAC2f import *
 from .LSC2f import *
 from .DMA import *
+from .sonic import *
 
 from .FuseConvolution import *
